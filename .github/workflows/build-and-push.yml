@@ -57,13 +57,14 @@ jobs:
           cache-from: type=registry,ref=${{ env.DOCKER_REPOSITORY }}:buildcache
           cache-to: type=registry,ref=${{ env.DOCKER_REPOSITORY }}:buildcache,mode=max
 
-      - name: Read agent config
-        id: agent_config
+      - name: Read agent config and skills
+        id: read_config
         run: |
+          # Read agent config
           echo "config=$(cat competitor_analysis_agent/agent_config.json | jq -c .)" >> $GITHUB_OUTPUT
           echo "version=$(cat .version | tr -d '\n')" >> $GITHUB_OUTPUT
 
-          # Read all skills from the skills folder
+          # Read all skills from the skills folder and write to a file
           skills_array="[]"
           for skill_dir in competitor_analysis_agent/skills/*/; do
             if [ -f "${skill_dir}skill.yaml" ]; then
@@ -71,96 +72,92 @@ jobs:
               skills_array=$(echo "$skills_array" | jq --argjson skill "$skill_json" '. += [$skill]')
             fi
           done
-          # Escape the skills JSON properly for shell
-          skills_escaped=$(echo "$skills_array" | jq -c . | sed 's/"/\\"/g' | sed 's/\\n/\\\\n/g')
-          echo "skills=$skills_escaped" >> $GITHUB_OUTPUT
+
+          # Write skills to a file instead of passing as output variable
+          echo "$skills_array" > /tmp/skills.json
+
+          # Write environment variables to a file
+          cat competitor_analysis_agent/agent_config.json | jq '.environment_variables // []' > /tmp/env_vars.json
+
+          # Write execution cost to a file
+          cat competitor_analysis_agent/agent_config.json | jq '.execution_cost // {}' > /tmp/exec_cost.json
+
+          # Write auth to a file
+          cat competitor_analysis_agent/agent_config.json | jq '.auth // {}' > /tmp/auth.json
 
       - name: Log to backend service
         env:
           BINDU_API_TOKEN: ${{ secrets.BINDU_API_TOKEN }}
         run: |
-          # Create a temporary file with the JSON payload
-          cat > /tmp/payload.json << 'EOF'
-          {
-            "agent": {
-              "name": "${{ fromJson(steps.agent_config.outputs.config).name }}",
-              "author": "${{ fromJson(steps.agent_config.outputs.config).author }}",
-              "description": "${{ fromJson(steps.agent_config.outputs.config).description }}",
-              "version": "${{ steps.agent_config.outputs.version }}",
-              "agent_trust": "${{ fromJson(steps.agent_config.outputs.config).agent_trust }}",
-              "type": "research"
-            },
-            "skills": ${{ steps.agent_config.outputs.skills }},
-            "framework": {
-              "name": "agno",
-              "version": "1.0.0"
-            },
-            "environment_variables": ${{ toJson(fromJson(steps.agent_config.outputs.config).environment_variables) }},
-            "execution_cost": ${{ toJson(fromJson(steps.agent_config.outputs.config).execution_cost || fromJson('{}')) }},
-            "auth": ${{ toJson(fromJson(steps.agent_config.outputs.config).auth || fromJson('{}')) }},
-            "deployment": {
-              "url": "${{ fromJson(steps.agent_config.outputs.config).deployment.url }}",
-              "protocol_version": "${{ fromJson(steps.agent_config.outputs.config).deployment.protocol_version }}",
-              "docker_image": "${{ env.DOCKER_REPOSITORY }}:latest",
-              "docker_digest": "${{ steps.docker_build.outputs.digest }}",
-              "platforms": ["linux/amd64", "linux/arm64"]
-            },
-            "repository": {
-              "url": "https://github.com/${{ github.repository }}",
-              "commit_sha": "${{ github.sha }}",
-              "build_number": "${{ github.run_number }}"
-            },
-            "metadata": {
-              "documentation_url": "https://Paraschamoli.github.io/competitor-analysis-agent/",
-              "domain": "${{ fromJson(steps.agent_config.outputs.config).metadata.domain || 'general' }}",
-              "specialization": "${{ fromJson(steps.agent_config.outputs.config).metadata.specialization || 'multi-purpose' }}",
-              "last_updated": "${{ github.event.head_commit.timestamp }}"
-            }
-          }
-          EOF
+          # Read the config values
+          AGENT_NAME=$(cat competitor_analysis_agent/agent_config.json | jq -r '.name')
+          AGENT_AUTHOR=$(cat competitor_analysis_agent/agent_config.json | jq -r '.author')
+          AGENT_DESCRIPTION=$(cat competitor_analysis_agent/agent_config.json | jq -r '.description')
+          AGENT_TRUST=$(cat competitor_analysis_agent/agent_config.json | jq -r '.agent_trust')
+          DEPLOYMENT_URL=$(cat competitor_analysis_agent/agent_config.json | jq -r '.deployment.url')
+          DEPLOYMENT_PROTOCOL=$(cat competitor_analysis_agent/agent_config.json | jq -r '.deployment.protocol_version')
+          METADATA_DOMAIN=$(cat competitor_analysis_agent/agent_config.json | jq -r '.metadata.domain // "general"')
+          METADATA_SPECIALIZATION=$(cat competitor_analysis_agent/agent_config.json | jq -r '.metadata.specialization // "multi-purpose"')
+          VERSION=$(cat .version | tr -d '\n')
 
-          # Use jq to process the template and replace variables
-          jq \
-            --arg name "${{ fromJson(steps.agent_config.outputs.config).name }}" \
-            --arg author "${{ fromJson(steps.agent_config.outputs.config).author }}" \
-            --arg description "${{ fromJson(steps.agent_config.outputs.config).description }}" \
-            --arg version "${{ steps.agent_config.outputs.version }}" \
-            --arg agent_trust "${{ fromJson(steps.agent_config.outputs.config).agent_trust }}" \
-            --argjson skills "${{ steps.agent_config.outputs.skills }}" \
-            --argjson env_vars "${{ toJson(fromJson(steps.agent_config.outputs.config).environment_variables) }}" \
-            --argjson exec_cost "${{ toJson(fromJson(steps.agent_config.outputs.config).execution_cost || fromJson('{}')) }}" \
-            --argjson auth "${{ toJson(fromJson(steps.agent_config.outputs.config).auth || fromJson('{}')) }}" \
-            --arg url "${{ fromJson(steps.agent_config.outputs.config).deployment.url }}" \
-            --arg protocol_version "${{ fromJson(steps.agent_config.outputs.config).deployment.protocol_version }}" \
+          # Create the final JSON payload using jq with file inputs
+          jq -n \
+            --arg name "$AGENT_NAME" \
+            --arg author "$AGENT_AUTHOR" \
+            --arg description "$AGENT_DESCRIPTION" \
+            --arg version "$VERSION" \
+            --arg agent_trust "$AGENT_TRUST" \
+            --slurpfile skills /tmp/skills.json \
+            --slurpfile env_vars /tmp/env_vars.json \
+            --slurpfile exec_cost /tmp/exec_cost.json \
+            --slurpfile auth /tmp/auth.json \
+            --arg url "$DEPLOYMENT_URL" \
+            --arg protocol_version "$DEPLOYMENT_PROTOCOL" \
             --arg docker_image "${{ env.DOCKER_REPOSITORY }}:latest" \
             --arg digest "${{ steps.docker_build.outputs.digest }}" \
             --arg repo_url "https://github.com/${{ github.repository }}" \
             --arg commit_sha "${{ github.sha }}" \
             --arg build_number "${{ github.run_number }}" \
             --arg docs_url "https://Paraschamoli.github.io/competitor-analysis-agent/" \
-            --arg domain "${{ fromJson(steps.agent_config.outputs.config).metadata.domain || 'general' }}" \
-            --arg specialization "${{ fromJson(steps.agent_config.outputs.config).metadata.specialization || 'multi-purpose' }}" \
+            --arg domain "$METADATA_DOMAIN" \
+            --arg specialization "$METADATA_SPECIALIZATION" \
             --arg last_updated "${{ github.event.head_commit.timestamp }}" \
-            '.agent.name = $name
-             | .agent.author = $author
-             | .agent.description = $description
-             | .agent.version = $version
-             | .agent.agent_trust = $agent_trust
-             | .skills = $skills
-             | .environment_variables = $env_vars
-             | .execution_cost = $exec_cost
-             | .auth = $auth
-             | .deployment.url = $url
-             | .deployment.protocol_version = $protocol_version
-             | .deployment.docker_image = $docker_image
-             | .deployment.docker_digest = $digest
-             | .repository.url = $repo_url
-             | .repository.commit_sha = $commit_sha
-             | .repository.build_number = $build_number
-             | .metadata.documentation_url = $docs_url
-             | .metadata.domain = $domain
-             | .metadata.specialization = $specialization
-             | .metadata.last_updated = $last_updated' /tmp/payload.json > /tmp/final_payload.json
+            '{
+              "agent": {
+                "name": $name,
+                "author": $author,
+                "description": $description,
+                "version": $version,
+                "agent_trust": $agent_trust,
+                "type": "research"
+              },
+              "skills": ($skills[0] // []),
+              "framework": {
+                "name": "agno",
+                "version": "1.0.0"
+              },
+              "environment_variables": ($env_vars[0] // []),
+              "execution_cost": ($exec_cost[0] // {}),
+              "auth": ($auth[0] // {}),
+              "deployment": {
+                "url": $url,
+                "protocol_version": $protocol_version,
+                "docker_image": $docker_image,
+                "docker_digest": $digest,
+                "platforms": ["linux/amd64", "linux/arm64"]
+              },
+              "repository": {
+                "url": $repo_url,
+                "commit_sha": $commit_sha,
+                "build_number": $build_number
+              },
+              "metadata": {
+                "documentation_url": $docs_url,
+                "domain": $domain,
+                "specialization": $specialization,
+                "last_updated": $last_updated
+              }
+            }' > /tmp/final_payload.json
 
           # Send the request
           curl --location 'https://bindus.getbindu.com/bindu-register' \
